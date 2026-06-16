@@ -1,36 +1,87 @@
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 const CACHE_PATH = process.env.TEAMS_MCP_CACHE_PATH ?? join(homedir(), ".teams-mcp-token-cache.json");
 const CACHE_LOCK_PATH = `${CACHE_PATH}.lock`;
+const CACHE_LOCK_OWNER_PATH = join(CACHE_LOCK_PATH, "owner");
 const LOCK_RETRY_DELAY_MS = 100;
 const LOCK_TIMEOUT_MS = 5000;
 const STALE_LOCK_MS = 30000;
+function createLockOwner() {
+    return `${process.pid}.${Date.now()}.${randomUUID()}`;
+}
+function parseOwnerPid(owner) {
+    const pid = Number(owner.split(".", 1)[0]);
+    return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+}
+function isProcessAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    }
+    catch (error) {
+        return error.code === "EPERM";
+    }
+}
+async function removeStaleCacheLockIfOrphaned() {
+    let stat;
+    try {
+        stat = await fs.stat(CACHE_LOCK_PATH);
+    }
+    catch (error) {
+        if (error.code === "ENOENT") {
+            return true;
+        }
+        throw error;
+    }
+    if (Date.now() - stat.mtimeMs <= STALE_LOCK_MS) {
+        return false;
+    }
+    let owner;
+    try {
+        owner = await fs.readFile(CACHE_LOCK_OWNER_PATH, "utf8");
+    }
+    catch (error) {
+        if (error.code !== "ENOENT") {
+            throw error;
+        }
+    }
+    const ownerPid = owner ? parseOwnerPid(owner) : undefined;
+    if (ownerPid && isProcessAlive(ownerPid)) {
+        return false;
+    }
+    await fs.rm(CACHE_LOCK_PATH, { recursive: true, force: true });
+    return true;
+}
 async function acquireCacheLock() {
     const startedAt = Date.now();
+    const owner = createLockOwner();
     await fs.mkdir(dirname(CACHE_PATH), { recursive: true });
     while (true) {
         try {
             await fs.mkdir(CACHE_LOCK_PATH);
-            return;
+            try {
+                await fs.writeFile(CACHE_LOCK_OWNER_PATH, owner, {
+                    encoding: "utf8",
+                    flag: "wx",
+                    mode: 0o600,
+                });
+            }
+            catch (error) {
+                await fs.rm(CACHE_LOCK_PATH, { recursive: true, force: true });
+                throw error;
+            }
+            return { owner };
         }
         catch (error) {
             const nodeError = error;
             if (nodeError.code !== "EEXIST") {
                 throw error;
             }
-            try {
-                const stat = await fs.stat(CACHE_LOCK_PATH);
-                if (Date.now() - stat.mtimeMs > STALE_LOCK_MS) {
-                    await fs.rm(CACHE_LOCK_PATH, { recursive: true, force: true });
-                    continue;
-                }
-            }
-            catch (statError) {
-                if (statError.code !== "ENOENT") {
-                    throw statError;
-                }
+            if (await removeStaleCacheLockIfOrphaned()) {
+                continue;
             }
             if (Date.now() - startedAt > LOCK_TIMEOUT_MS) {
                 throw new Error(`Timed out waiting for token cache lock: ${CACHE_LOCK_PATH}`);
@@ -39,13 +90,28 @@ async function acquireCacheLock() {
         }
     }
 }
+async function releaseCacheLock(lock) {
+    let owner;
+    try {
+        owner = await fs.readFile(CACHE_LOCK_OWNER_PATH, "utf8");
+    }
+    catch (error) {
+        if (error.code === "ENOENT") {
+            return;
+        }
+        throw error;
+    }
+    if (owner === lock.owner) {
+        await fs.rm(CACHE_LOCK_PATH, { recursive: true, force: true });
+    }
+}
 async function withCacheLock(operation) {
-    await acquireCacheLock();
+    const lock = await acquireCacheLock();
     try {
         return await operation();
     }
     finally {
-        await fs.rm(CACHE_LOCK_PATH, { recursive: true, force: true });
+        await releaseCacheLock(lock);
     }
 }
 async function quarantineInvalidCache() {
