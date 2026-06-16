@@ -5,7 +5,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // Mock the filesystem
 vi.mock("node:fs", () => ({
   promises: {
+    mkdir: vi.fn(),
     readFile: vi.fn(),
+    rename: vi.fn(),
+    rm: vi.fn(),
+    stat: vi.fn(),
     writeFile: vi.fn(),
   },
 }));
@@ -16,6 +20,10 @@ import { CACHE_PATH, cachePlugin } from "../msal-cache.js";
 describe("MSAL Cache Plugin", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
+    vi.mocked(fs.rename).mockResolvedValue(undefined);
+    vi.mocked(fs.rm).mockResolvedValue(undefined);
+    vi.mocked(fs.writeFile).mockResolvedValue(undefined);
   });
 
   describe("beforeCacheAccess", () => {
@@ -34,6 +42,7 @@ describe("MSAL Cache Plugin", () => {
 
       expect(fs.readFile).toHaveBeenCalledWith(CACHE_PATH, "utf8");
       expect(deserializeMock).toHaveBeenCalledWith(mockCacheData);
+      expect(fs.rm).toHaveBeenCalledWith(`${CACHE_PATH}.lock`, { recursive: true, force: true });
     });
 
     it("should handle missing cache file (ENOENT) silently", async () => {
@@ -85,6 +94,38 @@ describe("MSAL Cache Plugin", () => {
 
       consoleErrorSpy.mockRestore();
     });
+
+    it("should quarantine invalid cache data and continue with an empty cache", async () => {
+      const error = new SyntaxError("Unexpected non-whitespace character after JSON");
+      vi.mocked(fs.readFile).mockResolvedValue("{invalid-json}");
+
+      const deserializeMock = vi.fn().mockImplementation(() => {
+        throw error;
+      });
+      const cacheContext = {
+        tokenCache: {
+          deserialize: deserializeMock,
+        },
+      } as unknown as TokenCacheContext;
+
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {
+        // Intentionally empty to suppress console output during tests
+      });
+
+      await cachePlugin.beforeCacheAccess(cacheContext);
+
+      expect(deserializeMock).toHaveBeenCalledWith("{invalid-json}");
+      expect(fs.rename).toHaveBeenCalledWith(
+        CACHE_PATH,
+        expect.stringMatching(/\.teams-mcp-token-cache\.json\.corrupt\.\d+\.\d+$/)
+      );
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        "Warning: Token cache is invalid; moved aside:",
+        expect.stringMatching(/\.teams-mcp-token-cache\.json\.corrupt\.\d+\.\d+$/)
+      );
+
+      consoleErrorSpy.mockRestore();
+    });
   });
 
   describe("afterCacheAccess", () => {
@@ -102,7 +143,15 @@ describe("MSAL Cache Plugin", () => {
       await cachePlugin.afterCacheAccess(cacheContext);
 
       expect(serializeMock).toHaveBeenCalled();
-      expect(fs.writeFile).toHaveBeenCalledWith(CACHE_PATH, mockSerializedData, "utf8");
+      expect(fs.writeFile).toHaveBeenCalledWith(
+        expect.stringMatching(/\.teams-mcp-token-cache\.json\.\d+\.\d+\.tmp$/),
+        mockSerializedData,
+        { encoding: "utf8", mode: 0o600 }
+      );
+      expect(fs.rename).toHaveBeenCalledWith(
+        expect.stringMatching(/\.teams-mcp-token-cache\.json\.\d+\.\d+\.tmp$/),
+        CACHE_PATH
+      );
     });
 
     it("should not write cache data when cache has not changed", async () => {
@@ -142,7 +191,11 @@ describe("MSAL Cache Plugin", () => {
       await cachePlugin.afterCacheAccess(cacheContext);
 
       expect(serializeMock).toHaveBeenCalled();
-      expect(fs.writeFile).toHaveBeenCalledWith(CACHE_PATH, mockSerializedData, "utf8");
+      expect(fs.writeFile).toHaveBeenCalledWith(
+        expect.stringMatching(/\.teams-mcp-token-cache\.json\.\d+\.\d+\.tmp$/),
+        mockSerializedData,
+        { encoding: "utf8", mode: 0o600 }
+      );
       expect(consoleErrorSpy).toHaveBeenCalledWith("Warning: Could not write token cache:", error);
 
       consoleErrorSpy.mockRestore();
