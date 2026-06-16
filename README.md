@@ -321,6 +321,7 @@ npx @floriscornel/teams-mcp@latest                           # Start MCP server 
 
 - `TEAMS_MCP_READ_ONLY=true` - Start the MCP server in read-only mode
 - `AUTH_TOKEN=<jwt>` - Use a pre-existing Microsoft Graph access token instead of MSAL login
+- `TEAMS_MCP_CACHE_PATH=<path>` - Store the token cache at a custom path for isolated or concurrent MCP runtimes
 
 ### Read-Only Mode
 
