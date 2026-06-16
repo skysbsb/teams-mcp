@@ -324,6 +324,7 @@ npx @floriscornel/teams-mcp@latest                           # Start MCP server 
 - `TEAMS_MCP_CLIENT_ID=<guid>` - Authenticate with your own Azure AD app registration instead of the default Microsoft Graph CLI app
 - `TEAMS_MCP_TENANT_ID=<guid-or-domain>` - Pin the authority to a specific tenant (e.g. `contoso.onmicrosoft.com`); required for single-tenant app registrations
 - `TEAMS_MCP_SCOPES="User.Read Chat.ReadWrite"` - Override the permission scopes requested during authentication (comma or space separated)
+- `TEAMS_MCP_CACHE_PATH=<path>` - Store the token cache at a custom path for isolated or concurrent MCP runtimes
 
 ### Using Your Own Azure AD App Registration
 
