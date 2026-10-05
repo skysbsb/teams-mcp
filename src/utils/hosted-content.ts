@@ -13,8 +13,18 @@ export interface HostedContentRef {
   source: "body" | "audioCard";
 }
 
-const HOSTED_CONTENT_URL_REGEX = /hostedContents\/([a-zA-Z0-9_=-]+)\/\$value/i;
+// Captures the raw (possibly percent-encoded) path segment; only the ID is decoded
+const HOSTED_CONTENT_URL_REGEX = /hostedContents\/([^/?#]+)\/\$value/i;
 const BODY_HOSTED_CONTENT_REGEX = /hostedContents\/([a-zA-Z0-9_=-]+)\/\$value|itemid="([^"]+)"/gi;
+
+function decodePathSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    // Keep the raw segment when it is not valid percent-encoding
+    return segment;
+  }
+}
 
 function extractAudioCardIds(content: string | null | undefined): string[] {
   if (!content) return [];
@@ -33,14 +43,8 @@ function extractAudioCardIds(content: string | null | undefined): string[] {
   for (const item of media) {
     const url = (item as { url?: unknown })?.url;
     if (typeof url !== "string") continue;
-    let decodedUrl = url;
-    try {
-      decodedUrl = decodeURIComponent(url);
-    } catch {
-      // Keep the raw URL when it is not valid percent-encoding
-    }
-    const match = HOSTED_CONTENT_URL_REGEX.exec(decodedUrl);
-    if (match?.[1]) ids.push(match[1]);
+    const match = HOSTED_CONTENT_URL_REGEX.exec(url);
+    if (match?.[1]) ids.push(decodePathSegment(match[1]));
   }
   return ids;
 }

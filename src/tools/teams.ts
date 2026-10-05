@@ -1092,8 +1092,8 @@ export function registerTeamsTools(
           try {
             // Build hosted content endpoint based on whether it's a reply or main message
             const hostedContentEndpoint = replyId
-              ? `/teams/${teamId}/channels/${channelId}/messages/${messageId}/replies/${replyId}/hostedContents/${contentId}/$value`
-              : `/teams/${teamId}/channels/${channelId}/messages/${messageId}/hostedContents/${contentId}/$value`;
+              ? `/teams/${teamId}/channels/${channelId}/messages/${messageId}/replies/${replyId}/hostedContents/${encodeURIComponent(contentId)}/$value`
+              : `/teams/${teamId}/channels/${channelId}/messages/${messageId}/hostedContents/${encodeURIComponent(contentId)}/$value`;
 
             // Get the hosted content binary data
             const response = await client

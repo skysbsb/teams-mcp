@@ -411,7 +411,9 @@ export function registerChatTools(
         for (const contentId of contentIds) {
           try {
             const response = await client
-              .api(`/chats/${chatId}/messages/${messageId}/hostedContents/${contentId}/$value`)
+              .api(
+                `/chats/${chatId}/messages/${messageId}/hostedContents/${encodeURIComponent(contentId)}/$value`
+              )
               .responseType("arraybuffer" as any)
               .get();
 

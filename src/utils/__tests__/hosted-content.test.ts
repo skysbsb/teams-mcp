@@ -60,6 +60,24 @@ describe("extractHostedContentRefs", () => {
     expect(extractHostedContentRefs(message)).toEqual([{ id: "aWQ9Mw==", source: "audioCard" }]);
   });
 
+  it("preserves '+' and encoded slashes in audio card IDs", () => {
+    const message = {
+      attachments: [
+        {
+          contentType: AUDIO_CARD_CONTENT_TYPE,
+          content: audioCard(
+            "https://graph.microsoft.com/v1.0/chats/c/messages/m/hostedContents/a+b%2Fc%3D/$value",
+            "https://graph.microsoft.com/v1.0/chats/c/messages/m/hostedContents/bad%E0%A4%A/$value"
+          ),
+        },
+      ],
+    } as ChatMessage;
+    expect(extractHostedContentRefs(message)).toEqual([
+      { id: "a+b/c=", source: "audioCard" },
+      { id: "bad%E0%A4%A", source: "audioCard" },
+    ]);
+  });
+
   it("deduplicates IDs and keeps the first source", () => {
     const url = "https://graph.microsoft.com/v1.0/chats/c/messages/m/hostedContents/dup/$value";
     const message = {
