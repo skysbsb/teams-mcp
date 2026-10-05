@@ -1,4 +1,4 @@
-import { promises as fs } from "node:fs";
+import { promises as fs, type Stats } from "node:fs";
 import { basename, join } from "node:path";
 import type { TokenCacheContext } from "@azure/msal-node";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -52,6 +52,47 @@ function mockCacheReadError(error: Error): void {
     }
     throw new Error(`Unexpected read path: ${String(path)}`);
   });
+}
+
+function errnoError(code: string, message = code): NodeJS.ErrnoException {
+  const error = new Error(message) as NodeJS.ErrnoException;
+  error.code = code;
+  return error;
+}
+
+// Make mkdir(CACHE_LOCK_PATH) fail with EEXIST `times` times before succeeding
+function mockLockHeld(times: number): void {
+  let remaining = times;
+  vi.mocked(fs.mkdir).mockImplementation(async (path) => {
+    if (path === CACHE_LOCK_PATH && remaining > 0) {
+      remaining--;
+      throw errnoError("EEXIST");
+    }
+    return undefined;
+  });
+}
+
+function mockLockStat(ageMs: number): void {
+  vi.mocked(fs.stat).mockResolvedValue({ mtimeMs: Date.now() - ageMs } as Stats);
+}
+
+function mockExistingLockOwner(owner: string | Error): void {
+  vi.mocked(fs.readFile).mockImplementation(async (path) => {
+    if (path === CACHE_LOCK_OWNER_PATH) {
+      // The stale lock's owner until this process writes its own
+      if (currentLockOwner) return currentLockOwner;
+      if (owner instanceof Error) throw owner;
+      return owner;
+    }
+    if (path === CACHE_PATH) {
+      throw errnoError("ENOENT");
+    }
+    throw new Error(`Unexpected read path: ${String(path)}`);
+  });
+}
+
+function emptyContext(): TokenCacheContext {
+  return { tokenCache: { deserialize: vi.fn() } } as unknown as TokenCacheContext;
 }
 
 describe("MSAL Cache Plugin", () => {
@@ -276,6 +317,179 @@ describe("MSAL Cache Plugin", () => {
       );
       expect(consoleErrorSpy).toHaveBeenCalledWith("Warning: Could not write token cache:", error);
 
+      consoleErrorSpy.mockRestore();
+    });
+  });
+
+  describe("cache lock", () => {
+    const LOCK_RM_ARGS = [CACHE_LOCK_PATH, { recursive: true, force: true }] as const;
+
+    it("should evict a stale lock whose owner process is gone", async () => {
+      mockLockHeld(1);
+      mockLockStat(60_000);
+      mockExistingLockOwner("2147483646.1.dead-owner");
+      vi.spyOn(process, "kill").mockImplementation(() => {
+        throw errnoError("ESRCH");
+      });
+
+      await cachePlugin.beforeCacheAccess(emptyContext());
+
+      expect(fs.rm).toHaveBeenCalledWith(...LOCK_RM_ARGS);
+      expect(fs.writeFile).toHaveBeenCalledWith(CACHE_LOCK_OWNER_PATH, expect.any(String), {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+      vi.mocked(process.kill).mockRestore();
+    });
+
+    it("should evict a stale lock without an owner file", async () => {
+      mockLockHeld(1);
+      mockLockStat(60_000);
+      mockExistingLockOwner(errnoError("ENOENT"));
+
+      await cachePlugin.beforeCacheAccess(emptyContext());
+
+      expect(fs.rm).toHaveBeenCalledWith(...LOCK_RM_ARGS);
+    });
+
+    it("should retry when the lock disappears before it can be inspected", async () => {
+      mockLockHeld(1);
+      vi.mocked(fs.stat).mockRejectedValue(errnoError("ENOENT"));
+      mockExistingLockOwner(errnoError("ENOENT"));
+
+      await cachePlugin.beforeCacheAccess(emptyContext());
+
+      expect(fs.stat).toHaveBeenCalledWith(CACHE_LOCK_PATH);
+      expect(fs.mkdir).toHaveBeenCalledWith(CACHE_LOCK_PATH);
+    });
+
+    it("should wait for a fresh lock and acquire it once released", async () => {
+      mockLockHeld(1);
+      mockLockStat(0);
+      mockExistingLockOwner("1.1.fresh-owner");
+
+      await cachePlugin.beforeCacheAccess(emptyContext());
+
+      expect(fs.mkdir).toHaveBeenCalledTimes(3);
+      expect(fs.rm).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ["running", undefined],
+      ["owned by another user (EPERM)", errnoError("EPERM")],
+    ])("should not evict a stale lock whose owner is %s", async (_label, killError) => {
+      mockLockHeld(Number.POSITIVE_INFINITY);
+      mockLockStat(60_000);
+      mockExistingLockOwner(`${process.pid}.1.live-owner`);
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
+        if (killError) throw killError;
+        return true;
+      });
+      const now = Date.now();
+      const dateSpy = vi
+        .spyOn(Date, "now")
+        .mockReturnValueOnce(now)
+        .mockReturnValue(now + 60_000);
+
+      await expect(cachePlugin.beforeCacheAccess(emptyContext())).rejects.toThrow(
+        "Timed out waiting for token cache lock"
+      );
+      expect(fs.rm).not.toHaveBeenCalled();
+
+      killSpy.mockRestore();
+      dateSpy.mockRestore();
+    });
+
+    it("should propagate unexpected errors while inspecting the lock", async () => {
+      mockLockHeld(1);
+      vi.mocked(fs.stat).mockRejectedValue(errnoError("EACCES"));
+
+      await expect(cachePlugin.beforeCacheAccess(emptyContext())).rejects.toThrow("EACCES");
+    });
+
+    it("should propagate unexpected errors while reading the lock owner", async () => {
+      mockLockHeld(1);
+      mockLockStat(60_000);
+      mockExistingLockOwner(errnoError("EACCES"));
+
+      await expect(cachePlugin.beforeCacheAccess(emptyContext())).rejects.toThrow("EACCES");
+      expect(fs.rm).not.toHaveBeenCalled();
+    });
+
+    it("should propagate unexpected errors while creating the lock", async () => {
+      vi.mocked(fs.mkdir).mockImplementation(async (path) => {
+        if (path === CACHE_LOCK_PATH) throw errnoError("EACCES");
+        return undefined;
+      });
+
+      await expect(cachePlugin.beforeCacheAccess(emptyContext())).rejects.toThrow("EACCES");
+    });
+
+    it("should remove the lock directory when the owner file cannot be written", async () => {
+      vi.mocked(fs.writeFile).mockRejectedValue(errnoError("ENOSPC"));
+
+      await expect(cachePlugin.beforeCacheAccess(emptyContext())).rejects.toThrow("ENOSPC");
+      expect(fs.rm).toHaveBeenCalledWith(...LOCK_RM_ARGS);
+    });
+
+    it("should skip release when the lock was already removed", async () => {
+      vi.mocked(fs.writeFile).mockResolvedValue(undefined);
+      mockExistingLockOwner(errnoError("ENOENT"));
+
+      await cachePlugin.beforeCacheAccess(emptyContext());
+
+      expect(fs.rm).not.toHaveBeenCalled();
+    });
+
+    it("should propagate unexpected errors while releasing the lock", async () => {
+      vi.mocked(fs.writeFile).mockResolvedValue(undefined);
+      mockExistingLockOwner(errnoError("EACCES"));
+
+      await expect(cachePlugin.beforeCacheAccess(emptyContext())).rejects.toThrow("EACCES");
+    });
+
+    it("should warn when an invalid cache cannot be quarantined", async () => {
+      mockCacheRead("{invalid-json}");
+      const renameError = errnoError("EBUSY");
+      vi.mocked(fs.rename).mockRejectedValue(renameError);
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {
+        // Intentionally empty to suppress console output during tests
+      });
+      const cacheContext = {
+        tokenCache: {
+          deserialize: vi.fn().mockImplementation(() => {
+            throw new SyntaxError("bad");
+          }),
+        },
+      } as unknown as TokenCacheContext;
+
+      await cachePlugin.beforeCacheAccess(cacheContext);
+
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        "Warning: Could not quarantine invalid token cache:",
+        renameError
+      );
+      consoleErrorSpy.mockRestore();
+    });
+
+    it("should stay quiet when the invalid cache disappears before quarantine", async () => {
+      mockCacheRead("{invalid-json}");
+      vi.mocked(fs.rename).mockRejectedValue(errnoError("ENOENT"));
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {
+        // Intentionally empty to suppress console output during tests
+      });
+      const cacheContext = {
+        tokenCache: {
+          deserialize: vi.fn().mockImplementation(() => {
+            throw new SyntaxError("bad");
+          }),
+        },
+      } as unknown as TokenCacheContext;
+
+      await cachePlugin.beforeCacheAccess(cacheContext);
+
+      expect(consoleErrorSpy).not.toHaveBeenCalled();
       consoleErrorSpy.mockRestore();
     });
   });
